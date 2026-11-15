@@ -1,0 +1,172 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]*"
+  workflow_dispatch:
+    inputs:
+      version-override:
+        description: >-
+          Build wheels for an already-tagged version from current main
+          (sets SETUPTOOLS_SCM_PRETEND_VERSION).  Use only when main's
+          src/ is identical to that tag; publish skips existing files,
+          so only new wheels upload.
+        required: false
+        default: ""
+
+env:
+  SETUPTOOLS_SCM_PRETEND_VERSION: ${{ inputs.version-override || '' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build-sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v7
+      - run: uv build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+
+  build-pure-wheel:
+    name: Build pure Python wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v7
+      - run: uv build --wheel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-pure-wheel
+          path: dist/*.whl
+
+  build-mypyc-wheels:
+    name: Build mypyc wheels (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,      name: linux-x86_64,       cibw_archs_linux: x86_64  }
+          - { os: ubuntu-24.04-arm,   name: linux-aarch64,      cibw_archs_linux: aarch64 }
+          # riscv64 is split per Python version so each gets its own RISE
+          # runner and they build in parallel (~3 min each vs ~15 min serial).
+          - { os: ubuntu-24.04-riscv, name: linux-riscv64-310,  cibw_archs_linux: riscv64, cibw_build: "cp310-*" }
+          - { os: ubuntu-24.04-riscv, name: linux-riscv64-311,  cibw_archs_linux: riscv64, cibw_build: "cp311-*" }
+          - { os: ubuntu-24.04-riscv, name: linux-riscv64-312,  cibw_archs_linux: riscv64, cibw_build: "cp312-*" }
+          - { os: ubuntu-24.04-riscv, name: linux-riscv64-313,  cibw_archs_linux: riscv64, cibw_build: "cp313-*" }
+          - { os: ubuntu-24.04-riscv, name: linux-riscv64-314,  cibw_archs_linux: riscv64, cibw_build: "cp314-*" }
+          - { os: ubuntu-24.04-riscv, name: linux-riscv64-315,  cibw_archs_linux: riscv64, cibw_build: "cp315-*" }
+          - { os: macos-latest,       name: macos,              cibw_archs_linux: auto    }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v7
+      # The pypa/cibuildwheel action internally calls actions/setup-python,
+      # which has no riscv64 binaries. On native riscv64 runners, invoke
+      # cibuildwheel directly with the system Python instead.
+      - if: "!startsWith(matrix.name, 'linux-riscv64')"
+        uses: pypa/cibuildwheel@v4.2.0
+        env:
+          CIBW_ARCHS_LINUX: ${{ matrix.cibw_archs_linux }}
+          CIBW_BUILD: ${{ matrix.cibw_build || '*' }}
+          CIBW_ENVIRONMENT_PASS_LINUX: HATCH_BUILD_HOOK_ENABLE_MYPYC HATCH_BUILD_HOOK_ENABLE_CUSTOM SETUPTOOLS_SCM_PRETEND_VERSION
+          HATCH_BUILD_HOOK_ENABLE_MYPYC: "true"
+          # Cython scoring kernel; without it the wheel is ~1.4x slower.
+          HATCH_BUILD_HOOK_ENABLE_CUSTOM: "true"
+      # --break-system-packages: the RISE runner image marks its system
+      # Python as externally managed (PEP 668); there is no setup-python
+      # for riscv64, so installing into it is intentional.
+      - if: startsWith(matrix.name, 'linux-riscv64')
+        run: |
+          python3 -m pip install --break-system-packages cibuildwheel
+          python3 -m cibuildwheel --output-dir wheelhouse
+        env:
+          CIBW_ARCHS_LINUX: riscv64
+          CIBW_BUILD: ${{ matrix.cibw_build }}
+          CIBW_ENVIRONMENT_PASS_LINUX: HATCH_BUILD_HOOK_ENABLE_MYPYC HATCH_BUILD_HOOK_ENABLE_CUSTOM SETUPTOOLS_SCM_PRETEND_VERSION
+          HATCH_BUILD_HOOK_ENABLE_MYPYC: "true"
+          # Cython scoring kernel; without it the wheel is ~1.4x slower.
+          HATCH_BUILD_HOOK_ENABLE_CUSTOM: "true"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-mypyc-${{ matrix.name }}
+          path: wheelhouse/*.whl
+
+  build-mypyc-wheels-windows:
+    name: Build mypyc wheels (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, cibw_archs_windows: AMD64 }
+          - { os: windows-11-arm, cibw_archs_windows: ARM64 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # MSVC has a 16,380-char string literal limit (C2026). mypyc generates
+      # a single C file with an encoded source map that exceeds this with 15
+      # modules. Use separate=true on Windows so each module gets its own
+      # extension, avoiding the limit. This is ~50% slower than the
+      # single-library build used on Linux/macOS.
+      #
+      # models/__init__.py is additionally excluded from compilation here:
+      # in separate mode, the group library mypyc emits for a package
+      # __init__ (chardet/models__mypyc) is not packaged into the wheel by
+      # hatch-mypyc 0.16.0, so any wheel that compiles it fails on import
+      # with ModuleNotFoundError. Windows wheels ship models/__init__.py as
+      # pure Python instead, as every release through 7.4.3 did.
+      - name: Patch pyproject.toml for MSVC compatibility
+        run: |
+          ((Get-Content pyproject.toml) -replace 'options = \{ debug_level = "0" \}', 'options = { debug_level = "0", separate = true }') -replace '"/src/chardet/models/__init__\.py",', '' | Set-Content pyproject.toml
+        shell: pwsh
+      # Hide the patch from git so hatch-vcs derives the clean tagged version
+      # instead of a dirty dev version (e.g. 7.4.0.post2.dev0+g...).
+      - name: Restore clean git state for version derivation
+        run: git update-index --assume-unchanged pyproject.toml
+      - uses: astral-sh/setup-uv@v7
+      - uses: pypa/cibuildwheel@v4.2.0
+        env:
+          CIBW_ARCHS_WINDOWS: ${{ matrix.cibw_archs_windows }}
+          HATCH_BUILD_HOOK_ENABLE_MYPYC: "true"
+          # Cython scoring kernel; without it the wheel is ~1.4x slower.
+          HATCH_BUILD_HOOK_ENABLE_CUSTOM: "true"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-mypyc-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  publish:
+    name: Publish to PyPI
+    # Tag pushes and explicit version-override dispatches only: a bare
+    # "Run workflow" click on main would otherwise build for ~30 minutes
+    # and then try to publish dev-versioned artifacts (PyPI rejects local
+    # versions with a 400, or skip-existing silently no-ops on a tag).
+    if: github.ref_type == 'tag' || inputs.version-override != ''
+    needs: [build-sdist, build-pure-wheel, build-mypyc-wheels, build-mypyc-wheels-windows]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
